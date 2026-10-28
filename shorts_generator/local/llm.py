@@ -5,8 +5,11 @@ from typing import Dict, List, Optional, Tuple
 
 from .. import usage
 from ..config import (
+    current_base_url,
     current_model,
     current_provider,
+    normalize_base_url,
+    require_custom_key,
     require_gemini_key,
     require_groq_key,
     require_openai_key,
@@ -97,7 +100,11 @@ def call_openai_llm(prompt: str) -> str:
         ) from e
 
     model = current_model("openai")
-    client = OpenAI(api_key=require_openai_key())
+    base_url = current_base_url("openai")
+    kwargs = {"api_key": require_openai_key()}
+    if base_url:
+        kwargs["base_url"] = base_url
+    client = OpenAI(**kwargs)
     response = client.chat.completions.create(
         model=model,
         temperature=0.7,
@@ -105,6 +112,103 @@ def call_openai_llm(prompt: str) -> str:
     )
     usage.record("openai", model)
     return response.choices[0].message.content or ""
+
+
+def call_custom_llm(prompt: str) -> str:
+    """OpenAI-compatible server backend (Ollama, LM Studio, vLLM, OpenRouter, etc.)."""
+    try:
+        from openai import OpenAI  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "openai is required to talk to OpenAI-compatible servers. "
+            "Install it with:\n    pip install -r requirements-local.txt"
+        ) from e
+
+    model = current_model("custom")
+    base_url = current_base_url("custom")
+    key = require_custom_key()
+    client = OpenAI(api_key=key, base_url=base_url)
+
+    # Some local servers or models do not support response_format={"type": "json_object"}.
+    # Try with it first, fallback gracefully without it if rejected.
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        err_msg = str(e).lower()
+        if any(term in err_msg for term in ("response_format", "json_object", "400", "not supported", "unsupported")):
+            response = client.chat.completions.create(
+                model=model,
+                temperature=0.2,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        else:
+            raise
+
+    usage.record("custom", model)
+    return response.choices[0].message.content or ""
+
+
+def list_openai_compatible_models(base_url: str, api_key: Optional[str] = None) -> Tuple[bool, List[str], Optional[str]]:
+    """Text models an OpenAI-compatible server reports via /models.
+
+    Returns (ok, models_list, error_message).
+    """
+    url = normalize_base_url(base_url)
+    if not url:
+        return False, [], "Server URL cannot be empty."
+
+    effective_key = (api_key or "").strip()
+    if not effective_key:
+        from .. import user_config
+        effective_key = user_config.get("CUSTOM_API_KEY") or user_config.get("OPENAI_API_KEY")
+
+    last_err = None
+    try:
+        from openai import OpenAI  # type: ignore
+        client = OpenAI(api_key=effective_key or "not-needed", base_url=url, timeout=5.0)
+        res = client.models.list()
+        names = [str(getattr(m, "id", "") or "") for m in res]
+        names = [n for n in names if n and not any(bad in n.lower() for bad in ("embed", "tts", "whisper", "dall-e", "davinci"))]
+        names.sort()
+        return True, names, None
+    except Exception as e:
+        last_err = e
+
+    try:
+        import json
+        import urllib.request
+        headers = {}
+        if effective_key:
+            headers["Authorization"] = f"Bearer {effective_key}"
+        req = urllib.request.Request(f"{url}/models", headers=headers)
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            models = [str(m.get("id", "")) for m in data.get("data", []) if m.get("id")]
+            names = [n for n in models if n and not any(bad in n.lower() for bad in ("embed", "tts", "whisper", "dall-e", "davinci"))]
+            names.sort()
+            return True, names, None
+    except Exception as e:
+        last_err = e
+
+    msg = str(last_err or "")
+    if "401" in msg or "Unauthorized" in msg or "Missing API key" in msg or "Invalid API key" in msg or "invalid_api_key" in msg.lower():
+        err = "Authentication failed (401 Unauthorized): Check your API token/key in the API key field."
+    elif "403" in msg or "Forbidden" in msg:
+        err = "Access forbidden (403): Token does not have permission."
+    elif "404" in msg or "Not Found" in msg:
+        err = f"Endpoint not found (404) at {url}/models. Check the URL."
+    elif "Connection refused" in msg or "Errno 61" in msg or "ConnectError" in msg:
+        err = f"Could not connect to {url} (Connection refused). Make sure your server is running."
+    else:
+        err = f"Could not fetch models: {msg.splitlines()[0][:120]}"
+
+    print(f"[llm] could not list models from {url} ({err})", flush=True)
+    return False, [], err
 
 
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -261,6 +365,18 @@ def call_gemini_llm(prompt: str, contents: Optional[list] = None) -> str:
 _fallback_provider: Optional[str] = None
 
 
+def _custom_is_configured() -> bool:
+    try:
+        from .. import user_config
+        return bool(
+            user_config.get("CUSTOM_BASE_URL")
+            or user_config.get("CUSTOM_API_KEY")
+            or user_config.get("OPENAI_BASE_URL")
+        )
+    except Exception:
+        return False
+
+
 def _openai_is_configured() -> bool:
     try:
         return bool(require_openai_key())
@@ -276,10 +392,11 @@ def _groq_is_configured() -> bool:
 
 
 # Who to try when the preferred provider gives up, in order. Groq before
-# OpenAI because Groq's free tier costs nothing and OpenAI's does not exist:
-# falling back should not quietly start spending money.
+# custom and OpenAI because Groq's free tier costs nothing and custom runs
+# on your own hardware for free. OpenAI is the paid cloud fallback.
 _LADDER = (
     ("groq", _groq_is_configured),
+    ("custom", _custom_is_configured),
     ("openai", _openai_is_configured),
 )
 
@@ -308,7 +425,7 @@ def _switch_to_openai(why: str) -> None:
 # Groq's text model cannot see. This one can, and takes at most five images
 # per request, which is why the vision batch size asks who it is talking to.
 GROQ_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-_IMAGES_PER_REQUEST = {"gemini": 20, "openai": 20, "groq": 5}
+_IMAGES_PER_REQUEST = {"gemini": 20, "openai": 20, "groq": 5, "custom": 10}
 
 
 def _as_gemini_parts(parts: list) -> list:
@@ -333,14 +450,34 @@ def _openai_compatible_vision(parts: list, provider: str) -> str:
     from openai import OpenAI  # type: ignore
     if provider == "groq":
         client, model = OpenAI(api_key=require_groq_key(), base_url=GROQ_BASE_URL), GROQ_VISION_MODEL
+    elif provider in ("custom", "openai_compatible"):
+        client = OpenAI(api_key=require_custom_key(), base_url=current_base_url("custom"))
+        model = current_model("custom")
     else:
-        client, model = OpenAI(api_key=require_openai_key()), current_model("openai")
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0.1,
-        response_format={"type": "json_object"},
-        messages=[{"role": "user", "content": _as_openai_content(parts)}],
-    )
+        base_url = current_base_url("openai")
+        kwargs = {"api_key": require_openai_key()}
+        if base_url:
+            kwargs["base_url"] = base_url
+        client, model = OpenAI(**kwargs), current_model("openai")
+
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": _as_openai_content(parts)}],
+        )
+    except Exception as e:
+        err_msg = str(e).lower()
+        if any(term in err_msg for term in ("response_format", "json_object", "400", "not supported", "unsupported")):
+            response = client.chat.completions.create(
+                model=model,
+                temperature=0.1,
+                messages=[{"role": "user", "content": _as_openai_content(parts)}],
+            )
+        else:
+            raise
+
     usage.record(provider, model)
     return response.choices[0].message.content or ""
 
@@ -367,14 +504,18 @@ def call_vision_llm(parts: list) -> str:
     """
     images = sum(1 for p in parts if not isinstance(p, str))
     first = _fallback_provider or current_provider()
-    order = [first] + [p for p in ("gemini", "openai", "groq") if p != first]
-    configured = {"gemini": _gemini_is_configured, "openai": _openai_is_configured,
-                  "groq": _groq_is_configured}
+    order = [first] + [p for p in ("gemini", "openai", "groq", "custom") if p != first]
+    configured = {
+        "gemini": _gemini_is_configured,
+        "openai": _openai_is_configured,
+        "groq": _groq_is_configured,
+        "custom": _custom_is_configured,
+    }
     last: Optional[Exception] = None
     for name in order:
         if not configured.get(name, lambda: False)():
             continue
-        if images > _IMAGES_PER_REQUEST[name]:
+        if images > _IMAGES_PER_REQUEST.get(name, 20):
             continue
         try:
             if name == "gemini":
@@ -417,9 +558,11 @@ def call_local_llm(prompt: str) -> str:
         return call_openai_llm(prompt)
     if provider == "groq":
         return call_groq_llm(prompt)
+    if provider in ("custom", "openai_compatible"):
+        return call_custom_llm(prompt)
     if provider != "gemini":
         raise RuntimeError(
-            f"Unknown LLM_PROVIDER={provider!r}. Use 'gemini', 'groq' or 'openai'."
+            f"Unknown LLM_PROVIDER={provider!r}. Use 'gemini', 'groq', 'openai', or 'custom'."
         )
 
     if usage.is_exhausted("gemini", current_model("gemini")):

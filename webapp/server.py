@@ -170,6 +170,7 @@ class SettingsRequest(BaseModel):
     provider: str = "gemini"
     api_key: str = ""
     model: Optional[str] = None
+    base_url: Optional[str] = None
     # Store the key but keep the current provider — this is how an OpenAI key
     # gets saved as the thing that takes over when Gemini's day runs out,
     # rather than as a switch away from Gemini.
@@ -223,7 +224,12 @@ async def get_settings() -> dict:
     from shorts_generator.config import current_model, current_provider
 
     provider = current_provider()
-    from_env = bool(os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY"))
+    from_env = bool(
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or os.getenv("CUSTOM_BASE_URL")
+        or os.getenv("OPENAI_BASE_URL")
+    )
     return {
         "has_key": user_config.has_llm_key(),
         "provider": provider,
@@ -236,13 +242,23 @@ async def get_settings() -> dict:
         "keys": {
             "gemini": bool(user_config.get("GEMINI_API_KEY")),
             "groq": bool(user_config.get("GROQ_API_KEY")),
-            "openai": bool(user_config.get("OPENAI_API_KEY")),
+            "openai": bool(user_config.get("OPENAI_API_KEY") or user_config.get("OPENAI_BASE_URL")),
+            "custom": bool(
+                user_config.get("CUSTOM_BASE_URL")
+                or user_config.get("CUSTOM_API_KEY")
+                or user_config.get("OPENAI_BASE_URL")
+            ),
             # Not a model: the stock-footage library B-roll is drawn from.
             "pexels": bool(user_config.get("PEXELS_API_KEY")),
+        },
+        "base_urls": {
+            "openai": user_config.get("OPENAI_BASE_URL", ""),
+            "custom": user_config.get("CUSTOM_BASE_URL", "") or "http://localhost:11434/v1",
         },
         "daily_limits": {
             "gemini": user_config.get("GEMINI_DAILY_LIMIT"),
             "openai": user_config.get("OPENAI_DAILY_LIMIT"),
+            "custom": user_config.get("CUSTOM_DAILY_LIMIT"),
         },
         # An env var (or a .env beside the source) outranks the settings file
         # by design. Saying so is the difference between a switch that looks
@@ -256,8 +272,28 @@ async def get_settings() -> dict:
         "groq_models": GROQ_MODEL_OPTIONS,
         "model_pinned": bool(os.getenv("GEMINI_MODEL", "").strip())
         if provider == "gemini" else bool(os.getenv("GROQ_MODEL", "").strip())
-        if provider == "groq" else bool(os.getenv("OPENAI_MODEL", "").strip()),
+        if provider == "groq" else bool(os.getenv("CUSTOM_MODEL", "").strip())
+        if provider in ("custom", "openai_compatible") else bool(os.getenv("OPENAI_MODEL", "").strip()),
     }
+
+
+@app.get("/api/custom/models")
+async def get_custom_models(base_url: str = "", api_key: Optional[str] = None) -> dict:
+    """Probe an OpenAI-compatible server (e.g. Ollama, LM Studio) and return its models."""
+    from shorts_generator import user_config
+    from shorts_generator.local.llm import list_openai_compatible_models
+    url = (base_url or "").strip()
+    if not url:
+        url = user_config.get("CUSTOM_BASE_URL") or user_config.get("OPENAI_BASE_URL") or "http://localhost:11434/v1"
+
+    key = (api_key or "").strip()
+    if not key:
+        key = user_config.get("CUSTOM_API_KEY") or user_config.get("OPENAI_API_KEY")
+
+    ok, models, err = await asyncio.to_thread(list_openai_compatible_models, url, key)
+    if not ok:
+        return {"ok": False, "error": err or f"Could not fetch models from {url}.", "models": []}
+    return {"ok": True, "models": models}
 
 
 @app.get("/api/usage")
@@ -267,17 +303,24 @@ async def get_usage() -> dict:
     from shorts_generator.config import current_model, current_provider
 
     # Report each provider against the model actually selected for it.
-    snap = usage.snapshot({"gemini": current_model("gemini"),
-                           "openai": current_model("openai")})
+    snap = usage.snapshot({
+        "gemini": current_model("gemini"),
+        "openai": current_model("openai"),
+        "custom": current_model("custom"),
+    })
     provider = current_provider()
     snap["provider"] = provider
     snap["model"] = current_model(provider)
     # Whether a spent Gemini day would actually be survivable.
-    snap["fallback_ready"] = bool(user_config.get("OPENAI_API_KEY"))
+    snap["fallback_ready"] = bool(
+        user_config.get("OPENAI_API_KEY")
+        or user_config.get("CUSTOM_BASE_URL")
+        or user_config.get("CUSTOM_API_KEY")
+    )
 
     # A provider that is set up but unused today still has a budget worth
     # showing — the whole point of a meter is to read it *before* spending.
-    for name, key in (("gemini", "GEMINI_API_KEY"), ("openai", "OPENAI_API_KEY")):
+    for name, key in (("gemini", "GEMINI_API_KEY"), ("openai", "OPENAI_API_KEY"), ("custom", "CUSTOM_BASE_URL")):
         if name in snap["providers"] or not user_config.get(key):
             continue
         model = current_model(name)
@@ -294,26 +337,42 @@ async def set_settings(req: SettingsRequest) -> dict:
     from shorts_generator import user_config
 
     provider = (req.provider or "gemini").strip().lower()
-    # A mapping rather than a chain of two-way ternaries: with three providers
-    # the "gemini or else openai" shape silently files Groq's key under
-    # OpenAI's name, which is the kind of bug that only shows up as a
-    # confusing auth failure much later.
-    prefixes = {"gemini": "GEMINI", "openai": "OPENAI", "groq": "GROQ"}
+    prefixes = {
+        "gemini": "GEMINI",
+        "openai": "OPENAI",
+        "groq": "GROQ",
+        "custom": "CUSTOM",
+        "openai_compatible": "CUSTOM",
+    }
     if provider not in prefixes:
-        raise HTTPException(400, "Provider must be 'gemini', 'groq' or 'openai'.")
+        raise HTTPException(400, "Provider must be 'gemini', 'groq', 'openai', or 'custom'.")
     prefix = prefixes[provider]
 
     key = (req.api_key or "").strip()
     key_name = f"{prefix}_API_KEY"
-    # Switching to a provider whose key is already stored must not demand the
-    # key again — retyping a secret you already saved is not a security step,
-    # it is just a reason to keep the wrong provider selected.
-    if not key and not user_config.get(key_name):
+    base_url = req.base_url.strip() if req.base_url is not None else None
+
+    # Custom provider or custom base_url doesn't require an API key (e.g. Ollama, LM Studio).
+    # Gemini and Groq always require a key. OpenAI requires a key unless a custom base_url is set.
+    has_stored_url = bool(user_config.get(f"{prefix}_BASE_URL") or user_config.get("OPENAI_BASE_URL"))
+    url_provided = bool(base_url) or has_stored_url
+    needs_key = provider in ("gemini", "groq") or (provider == "openai" and not url_provided)
+
+    if needs_key and not key and not user_config.get(key_name):
         raise HTTPException(400, "Paste an API key first.")
 
     values = {} if req.as_fallback else {"LLM_PROVIDER": provider}
     if key:
         values[key_name] = key
+    elif provider in ("custom", "openai_compatible") and not user_config.get(key_name):
+        # Default placeholder key for local servers that don't require auth
+        values[key_name] = "not-needed"
+
+    if base_url is not None:
+        values[f"{prefix}_BASE_URL"] = base_url.rstrip("/")
+        if provider == "openai":
+            values["OPENAI_BASE_URL"] = base_url.rstrip("/")
+
     if req.model:
         model = req.model.strip()
         if provider == "gemini":
@@ -325,6 +384,9 @@ async def set_settings(req: SettingsRequest) -> dict:
             if problem:
                 raise HTTPException(400, problem)
         values[f"{prefix}_MODEL"] = model
+        if provider in ("custom", "openai_compatible") and not values.get(f"{prefix}_BASE_URL") and not user_config.get(f"{prefix}_BASE_URL"):
+            values[f"{prefix}_BASE_URL"] = "http://localhost:11434/v1"
+
     if req.daily_limit is not None:
         cap = req.daily_limit.strip()
         if cap and not cap.isdigit():

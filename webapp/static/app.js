@@ -238,19 +238,30 @@ $("cYes").onclick = () => { const f = confirmFn; closeAsk(); if (f) f(); };
 
 // ---------------------------------------------------------------- settings
 
+let cachedSettings = null;
+
 async function checkSetup() {
   try {
     const d = await api("/api/settings");
+    cachedSettings = d;
     if (!d.has_key) $("setup").classList.remove("hidden");
     if (d.provider) {
       $("setProvider").value = d.provider;
       $("setProvider2").value = d.provider;
     }
+    if (d.base_urls) {
+      if ($("setBaseUrl")) $("setBaseUrl").value = d.base_urls.custom || "";
+      if ($("setBaseUrl2")) $("setBaseUrl2").value = (d.provider === "openai" ? d.base_urls.openai : d.base_urls.custom) || "";
+    }
+    if (d.model) {
+      if ($("setCustomModel")) $("setCustomModel").value = d.model;
+      if ($("setCustomModel2")) $("setCustomModel2").value = d.model;
+    }
     keysOnFile = d.keys || {};
     pexelsReady = !!keysOnFile.pexels;
     drawPexels();
     providerPinned = !!d.provider_pinned;
-    drawModels(d);
+    updateProviderDrawer(d.provider, d);
     if (d.daily_limits) $("capOpenai").value = d.daily_limits.openai || "";
     drawSwitcher(d.provider);
     $("setInfo").innerHTML = `
@@ -368,17 +379,64 @@ async function saveModel(model, provider) {
   }
 }
 
+function updateProviderDrawer(provider, d = null) {
+  const isCustom = provider === "custom";
+  const isOpenAI = provider === "openai";
+  const urlFld = $("serverUrlFld2");
+  const customModelFld = $("customModelFld2");
+  const modelFld = $("modelFld");
+  const hint = $("modelHint");
+  const keyLabel = $("setKey2Label");
+  const keyInput = $("setKey2");
+  const urlHint = $("serverUrlHint");
+
+  if (isCustom) {
+    if (urlFld) urlFld.hidden = false;
+    if (customModelFld) customModelFld.hidden = false;
+    if (modelFld) modelFld.hidden = true;
+    if (urlHint) urlHint.textContent = "e.g. http://localhost:11434/v1 for Ollama, http://localhost:1234/v1 for LM Studio";
+    if (keyLabel) keyLabel.textContent = "API key (optional for local servers)";
+    if (keyInput) keyInput.placeholder = "Leave blank for Ollama/LM Studio, or paste key";
+    if (hint) hint.textContent = "Runs locally on your own machine or remote OpenAI-compatible server.";
+  } else if (isOpenAI) {
+    if (urlFld) urlFld.hidden = false;
+    if (customModelFld) customModelFld.hidden = false;
+    if (modelFld) modelFld.hidden = true;
+    if (urlHint) urlHint.textContent = "Leave empty for official OpenAI, or paste custom server/proxy URL.";
+    if (keyLabel) keyLabel.textContent = "Replace API key";
+    if (keyInput) keyInput.placeholder = "sk-…";
+    if (hint) hint.textContent = "Paid OpenAI API, or any OpenAI-compatible server using your custom URL.";
+  } else {
+    if (urlFld) urlFld.hidden = true;
+    if (customModelFld) customModelFld.hidden = true;
+    if (keyLabel) keyLabel.textContent = "Replace API key";
+    if (keyInput) keyInput.placeholder = "Paste a new key";
+    if (d) {
+      drawModels(d);
+    } else if (cachedSettings) {
+      drawModels(cachedSettings);
+    }
+  }
+}
+
+$("setProvider2").onchange = () => {
+  updateProviderDrawer($("setProvider2").value, cachedSettings);
+};
+
 // Which providers already have a key on disk, so the switcher can offer a
 // flip instead of demanding a secret that was saved hours ago.
 let keysOnFile = {};
 let providerPinned = false;
 
 function drawSwitcher(active) {
-  const other = active === "gemini" ? "openai" : "gemini";
-  const label = other === "gemini" ? "Gemini" : "OpenAI";
+  const providers = ["gemini", "groq", "custom", "openai"];
+  const other = providers.find(p => p !== active && keysOnFile[p]);
   const el = $("switcher");
-  if (!keysOnFile[other]) { el.hidden = true; return; }
+  if (!other) { el.hidden = true; return; }
   el.hidden = false;
+
+  const names = { gemini: "Gemini", groq: "Groq", custom: "Custom/Local", openai: "OpenAI" };
+  const label = names[other] || other;
 
   // An LLM_PROVIDER env var wins over the settings file, so saving here would
   // change nothing visible. Better to say that than to offer a dead button.
@@ -404,7 +462,8 @@ async function switchProvider(provider) {
     await api("/api/settings", json("POST", { provider }));
     await checkSetup();
     refreshUsage();
-    toast(`Now using ${provider === "gemini" ? "Gemini" : "OpenAI"}.`);
+    const names = { gemini: "Gemini", groq: "Groq", custom: "Custom/Local", openai: "OpenAI" };
+    toast(`Now using ${names[provider] || provider}.`);
   } catch (e) {
     toast(e.message || "Could not switch provider.", true);
     btn.textContent = was;
@@ -468,12 +527,12 @@ async function refreshUsage() {
     const u = await api("/api/usage");
     const g = u.providers.gemini || null;
     const o = u.providers.openai || null;
+    const c = u.providers.custom || null;
 
-    // The bar only means something against a known cap. OpenAI has no daily
-    // limit to fill, so it stays a number and the bar stays hidden.
     $("meters").innerHTML = [
       meterHtml("Gemini", g),
       meterHtml("OpenAI", o),
+      meterHtml("Custom / Local", c),
     ].filter(Boolean).join("");
 
     drawBudget(g, u);
@@ -482,18 +541,19 @@ async function refreshUsage() {
     // Anything without a cap has no bar, so it still needs a plain count.
     if (g && !g.limit) rows.push(`<div><span>Gemini</span><b>${g.used} used</b></div>`);
     if (o && !o.limit) rows.push(`<div><span>OpenAI</span><b>${o.used} used</b></div>`);
-    if (!g && !o) rows.push(`<div><span>Requests</span><b>none yet today</b></div>`);
+    if (c && !c.limit) rows.push(`<div><span>Custom / Local</span><b>${c.used} used</b></div>`);
+    if (!g && !o && !c) rows.push(`<div><span>Requests</span><b>none yet today</b></div>`);
     rows.push(`<div><span>Resets in</span><b>${fmtSpan(u.resets_in_seconds)}</b></div>`);
     $("usageInfo").innerHTML = rows.join("");
 
     let hint;
     if (g && g.exhausted && u.fallback_ready) {
-      hint = "Gemini is out for today — runs will continue on OpenAI automatically.";
+      hint = "Gemini is out for today — runs will continue on backup provider automatically.";
     } else if (g && g.exhausted) {
-      hint = "Gemini is out for today. Add an OpenAI key below to keep going, "
+      hint = "Gemini is out for today. Add a backup key below to keep going, "
            + "or come back after the reset — a part-finished run picks up where it stopped.";
     } else if (u.fallback_ready) {
-      hint = "If Gemini runs out mid-run, OpenAI takes over automatically.";
+      hint = "If Gemini runs out mid-run, backup takes over automatically.";
     } else {
       hint = "A long video costs roughly one request per 20 minutes, plus two.";
     }
@@ -501,13 +561,11 @@ async function refreshUsage() {
   } catch (_) { /* the app still works without a usage panel */ }
 }
 
-// A table, not a ternary: with three providers "gemini or else openai" sends
-// Groq users to OpenAI's signup page, which is a dead end they have to work
-// out for themselves.
 const KEY_LINKS = {
   gemini: ["Get a free Gemini key →", "https://aistudio.google.com/apikey"],
   groq:   ["Get a free Groq key →",   "https://console.groq.com/keys"],
   openai: ["Get an OpenAI key →",     "https://platform.openai.com/api-keys"],
+  custom: ["Ollama docs →",           "https://ollama.com"],
 };
 
 function keyLinkFor(provider) {
@@ -515,19 +573,112 @@ function keyLinkFor(provider) {
   $("keyLink").textContent = label;
   $("keyLink").href = href;
 }
-$("setProvider").onchange = () => keyLinkFor($("setProvider").value);
+
+function onSetupProviderChange() {
+  const p = $("setProvider").value;
+  keyLinkFor(p);
+  const isCustom = p === "custom";
+  const isOpenAI = p === "openai";
+  const customFields = $("customSetupFields");
+  if (customFields) {
+    if (isCustom || isOpenAI) {
+      customFields.classList.remove("hidden");
+      if (isCustom) {
+        $("setBaseUrl").placeholder = "http://localhost:11434/v1";
+        $("setKey").placeholder = "Optional for Ollama / local servers";
+      } else {
+        $("setBaseUrl").placeholder = "https://api.openai.com/v1 (optional)";
+        $("setKey").placeholder = "Paste your OpenAI key (sk-…)";
+      }
+    } else {
+      customFields.classList.add("hidden");
+      $("setKey").placeholder = "Paste your key here";
+    }
+  }
+}
+$("setProvider").onchange = onSetupProviderChange;
+
+async function fetchServerModels(context) {
+  const isSetup = context === "setup";
+  const urlEl = isSetup ? $("setBaseUrl") : $("setBaseUrl2");
+  const modelEl = isSetup ? $("setCustomModel") : $("setCustomModel2");
+  const keyEl = isSetup ? $("setKey") : $("setKey2");
+  const listEl = isSetup ? $("setupModelList") : $("drawerModelList");
+  const btn = isSetup ? $("btnTestSetup") : $("btnTestDrawer");
+
+  if (!urlEl || !btn) return;
+  let url = (urlEl.value || "").trim() || "http://localhost:11434/v1";
+  urlEl.value = url;
+  const key = keyEl ? (keyEl.value || "").trim() : "";
+
+  btn.disabled = true;
+  const oldText = btn.textContent;
+  btn.textContent = "Connecting…";
+
+  try {
+    const res = await api(`/api/custom/models?base_url=${encodeURIComponent(url)}&api_key=${encodeURIComponent(key)}`);
+    if (res.ok && res.models && res.models.length) {
+      if (listEl) {
+        listEl.innerHTML = res.models.map(m => `<option value="${esc(m)}">`).join("");
+      }
+      if (modelEl && (!modelEl.value || !res.models.includes(modelEl.value))) {
+        modelEl.value = res.models[0];
+      }
+      toast(`Connected! Found ${res.models.length} model(s).`);
+    } else {
+      toast(res.error || "Could not fetch models.", true);
+    }
+  } catch (e) {
+    toast(e.message || "Failed to reach server.", true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = oldText;
+  }
+}
+
+if ($("btnTestSetup")) $("btnTestSetup").onclick = () => fetchServerModels("setup");
+if ($("btnTestDrawer")) $("btnTestDrawer").onclick = () => fetchServerModels("drawer");
 
 async function saveKey(providerEl, keyEl, btn, msgEl, onDone) {
+  const provider = providerEl.value;
   const key = keyEl.value.trim();
-  if (!key) { msgEl.innerHTML = `<div class="err">Paste a key first.</div>`; return; }
+  const isCustom = provider === "custom";
+  const isOpenAI = provider === "openai";
+
+  let baseUrl = "";
+  let model = "";
+  if (providerEl.id === "setProvider") {
+    baseUrl = $("setBaseUrl") ? $("setBaseUrl").value.trim() : "";
+    model = $("setCustomModel") ? $("setCustomModel").value.trim() : "";
+  } else {
+    baseUrl = $("setBaseUrl2") ? $("setBaseUrl2").value.trim() : "";
+    model = $("setCustomModel2") ? $("setCustomModel2").value.trim() : "";
+  }
+
+  // Gemini and Groq always require a key. Custom does not. OpenAI requires a key unless baseUrl is configured.
+  if (!isCustom && !(isOpenAI && (baseUrl || keysOnFile.custom || keysOnFile.openai))) {
+    if (!key && !keysOnFile[provider]) {
+      msgEl.innerHTML = `<div class="err">Paste a key first.</div>`;
+      return;
+    }
+  }
+
   const label = btn.textContent;
   btn.disabled = true;
   btn.textContent = "Saving…";
   try {
-    await api("/api/settings", json("POST", { provider: providerEl.value, api_key: key }));
+    const payload = { provider, api_key: key };
+    if (isCustom || isOpenAI) {
+      if (baseUrl) payload.base_url = baseUrl;
+      if (model) payload.model = model;
+      if (isCustom && !baseUrl) payload.base_url = "http://localhost:11434/v1";
+      if (isCustom && !model) payload.model = "llama3.2";
+    }
+    await api("/api/settings", json("POST", payload));
     msgEl.innerHTML = `<div class="ok-box">Saved. You're ready to go.</div>`;
     keyEl.value = "";
-    checkSetup();
+    await checkSetup();
+    refreshUsage();
     if (onDone) setTimeout(onDone, 1100);
   } catch (e) {
     msgEl.innerHTML = `<div class="err">${esc(e.message)}</div>`;
@@ -4200,6 +4351,7 @@ $("pMini").onclick = () => {
 // ---------------------------------------------------------------- boot
 
 keyLinkFor($("setProvider").value);
+onSetupProviderChange();
 checkSetup();
 refreshUsage();
 loadProcessor();

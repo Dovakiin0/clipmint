@@ -266,6 +266,16 @@ def _write_folder_guide() -> None:
 
 def has_llm_key() -> bool:
     provider = (get("LLM_PROVIDER", "gemini") or "gemini").lower()
+    if provider in ("custom", "openai_compatible", "openai-compatible", "ollama", "lmstudio", "local"):
+        return bool(
+            get("CUSTOM_BASE_URL")
+            or get("CUSTOM_API_KEY")
+            or get("OPENAI_BASE_URL")
+            or os.getenv("CUSTOM_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+        )
     if provider == "openai":
-        return bool(get("OPENAI_API_KEY"))
+        return bool(get("OPENAI_API_KEY") or get("OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
+    if provider == "groq":
+        return bool(get("GROQ_API_KEY"))
     return bool(get("GEMINI_API_KEY"))

@@ -154,7 +154,7 @@ addEventListener("load", function () {
     <!-- first-run setup -->
     <section class="panel accent hidden" id="setup">
       <div class="p-head"><h2><svg><use href="#i-spark"/></svg>Set up in 30 seconds</h2></div>
-      <p class="lead">Picking the best moments needs one free API key. It is stored on this PC only.</p>
+      <p class="lead">Picking the best moments needs an AI model. Choose a free cloud key or your own local server.</p>
       <div class="two">
         <label class="fld">
           <span>Provider</span>
@@ -162,11 +162,26 @@ addEventListener("load", function () {
             <option value="gemini" selected>Google Gemini &mdash; free tier</option>
             <option value="groq">Groq &mdash; free, no card</option>
             <option value="openai">OpenAI</option>
+            <option value="custom">OpenAI-compatible / Custom Server (Ollama, LM Studio&hellip;)</option>
           </select>
         </label>
-        <label class="fld">
+        <label class="fld" id="setKeyFld">
           <span>API key <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" id="keyLink">Get a free Gemini key &rarr;</a></span>
           <input type="password" id="setKey" placeholder="Paste your key here">
+        </label>
+      </div>
+      <div class="two hidden" id="customSetupFields">
+        <label class="fld">
+          <span>Server URL (Base URL)</span>
+          <div class="row">
+            <input type="text" id="setBaseUrl" placeholder="http://localhost:11434/v1">
+            <button class="btn ghost sm" type="button" id="btnTestSetup">Fetch models</button>
+          </div>
+        </label>
+        <label class="fld">
+          <span>Model name</span>
+          <input type="text" id="setCustomModel" placeholder="e.g. llama3.2, mistral, gpt-4o" list="setupModelList">
+          <datalist id="setupModelList"></datalist>
         </label>
       </div>
       <button class="btn primary" id="setSave">Save and continue</button>
@@ -637,11 +652,25 @@ addEventListener("load", function () {
         <option value="gemini">Google Gemini &mdash; free tier</option>
         <option value="groq">Groq &mdash; free, no card</option>
         <option value="openai">OpenAI</option>
+        <option value="custom">OpenAI-compatible / Custom Server (Ollama, LM Studio&hellip;)</option>
       </select>
     </label>
+    <label class="fld" id="serverUrlFld2" hidden>
+      <span>Server URL (Base URL)</span>
+      <div class="row">
+        <input type="text" id="setBaseUrl2" placeholder="http://localhost:11434/v1">
+        <button class="btn ghost sm" type="button" id="btnTestDrawer">Fetch models</button>
+      </div>
+      <p class="hint" id="serverUrlHint">e.g. http://localhost:11434/v1 for Ollama, http://localhost:1234/v1 for LM Studio</p>
+    </label>
     <label class="fld" id="modelFld" hidden>
-      <span>Gemini model &mdash; free requests per day differ a lot</span>
+      <span id="modelFldTitle">Gemini model &mdash; free requests per day differ a lot</span>
       <select id="setModel"></select>
+    </label>
+    <label class="fld" id="customModelFld2" hidden>
+      <span>Model name</span>
+      <input type="text" id="setCustomModel2" placeholder="e.g. llama3.2, mistral, gpt-4o" list="drawerModelList">
+      <datalist id="drawerModelList"></datalist>
     </label>
     <p class="hint" id="modelHint"></p>
     <div class="switcher" id="switcher" hidden>
@@ -649,10 +678,10 @@ addEventListener("load", function () {
       <button class="btn ghost sm" id="switchBtn"></button>
     </div>
     <label class="fld">
-      <span>Replace API key</span>
+      <span id="setKey2Label">Replace API key</span>
       <input type="password" id="setKey2" placeholder="Paste a new key">
     </label>
-    <button class="btn ghost" id="setSave2">Save key</button>
+    <button class="btn ghost" id="setSave2">Save settings</button>
     <div id="setMsg2"></div>
   </div>
 

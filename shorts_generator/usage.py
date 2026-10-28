@@ -138,14 +138,12 @@ def _model_entry(data: Dict, provider: str, model: str) -> Dict:
 
 def daily_limit(provider: str, model: str) -> int:
     """Requests per day for this model, or DAILY_LIMIT_UNKNOWN if uncapped."""
-    override = user_config.get(
-        "GEMINI_DAILY_LIMIT" if provider == "gemini" else "OPENAI_DAILY_LIMIT"
-    )
+    override = user_config.get(f"{provider.upper()}_DAILY_LIMIT")
     if override.isdigit():
         return int(override)
     if provider != "gemini":
-        # OpenAI bills rather than cutting you off, so there is no honest
-        # number to show here.
+        # OpenAI/Custom bills or runs on own hardware, so there is no
+        # fixed external cap to show here unless user set an override.
         return DAILY_LIMIT_UNKNOWN
     return FREE_TIER_DAILY_LIMITS.get(model.strip(), DAILY_LIMIT_UNKNOWN)
 
